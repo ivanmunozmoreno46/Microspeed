@@ -1,5 +1,89 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Peer, DataConnection } from 'peerjs';
+import { Peer, DataConnection, PeerOptions } from 'peerjs';
+
+// =========================================================
+// 0. CONFIGURACIÓN DE RED (PeerJS)
+// =========================================================
+// Base del enfoque (inspirado en PlayHubGX): PeerJS con sus defaults (broker
+// + STUN/TURN públicos que trae la librería) y un peer id del host con
+// prefijo (`microspeed-room-<CODE>`) para namespacing en el broker compartido.
+//
+// Encima de esa base, para atravesar CGNAT / 5G de forma fiable, pedimos
+// credenciales TURN frescas a nuestro backend `VITE_TURN_SERVER_URL` en el
+// arranque (endpoint `GET /ice-servers`). El backend mantiene el API Token
+// de Cloudflare Realtime a buen recaudo y devuelve credenciales efímeras que
+// caducan solas; el cliente solo ve el par usuario/credencial ya caducable.
+//
+// Fallbacks: si `VITE_TURN_SERVER_URL` está vacío o falla la llamada, se usan
+// las variables estáticas `VITE_TURN_URL/USERNAME/CREDENTIAL` si existen, y
+// si tampoco hay nada se confía en los defaults de PeerJS.
+const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin O/0/1/I/L ambiguos
+const PEER_ID_PREFIX = 'microspeed-room-';
+const ROOM_CODE_LENGTH = 6;
+
+const metaEnv: Record<string, string | undefined> = (import.meta as any).env ?? {};
+const turnServerUrl = (metaEnv.VITE_TURN_SERVER_URL || '').replace(/\/+$/, '');
+const staticTurnUrl = metaEnv.VITE_TURN_URL;
+const staticTurnUsername = metaEnv.VITE_TURN_USERNAME;
+const staticTurnCredential = metaEnv.VITE_TURN_CREDENTIAL;
+
+const staticIceServers: RTCIceServer[] = [];
+if (staticTurnUrl && staticTurnUsername && staticTurnCredential) {
+  staticIceServers.push({ urls: 'stun:stun.l.google.com:19302' });
+  staticIceServers.push({
+    urls: staticTurnUrl.split(',').map((s) => s.trim()).filter(Boolean),
+    username: staticTurnUsername,
+    credential: staticTurnCredential,
+  });
+}
+
+let iceServersPromise: Promise<RTCIceServer[] | null> | null = null;
+
+function fetchIceServers(): Promise<RTCIceServer[] | null> {
+  if (iceServersPromise) return iceServersPromise;
+  if (!turnServerUrl) {
+    iceServersPromise = Promise.resolve(staticIceServers.length ? staticIceServers : null);
+    return iceServersPromise;
+  }
+  iceServersPromise = fetch(`${turnServerUrl}/ice-servers`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((payload: any) => {
+      const list = payload?.iceServers;
+      if (Array.isArray(list) && list.length > 0) return list as RTCIceServer[];
+      return staticIceServers.length ? staticIceServers : null;
+    })
+    .catch(() => (staticIceServers.length ? staticIceServers : null));
+  return iceServersPromise;
+}
+
+async function buildPeerOptions(): Promise<PeerOptions> {
+  const options: PeerOptions = { debug: 2 };
+  const ice = await fetchIceServers();
+  if (ice && ice.length > 0) {
+    options.config = { iceServers: ice };
+  }
+  return options;
+}
+
+// Kick off fetch as early as possible so the user doesn't wait on it when
+// clicking "Crear Sala" / "Unirse a Sala".
+fetchIceServers();
+
+function generateRoomCode(): string {
+  let code = '';
+  for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
+    code += ROOM_CODE_CHARS[Math.floor(Math.random() * ROOM_CODE_CHARS.length)];
+  }
+  return code;
+}
+
+function toHostPeerId(code: string): string {
+  return `${PEER_ID_PREFIX}${code.toUpperCase()}`;
+}
+
+function normalizeRoomCode(raw: string): string {
+  return String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, ROOM_CODE_LENGTH);
+}
 
 // =========================================================
 // 1. CONFIGURACIÓN DEL CIRCUITO
@@ -229,24 +313,27 @@ export default function App() {
     setErrorMsg('');
   };
 
-  const createRoom = () => {
+  const createRoom = async () => {
     setIsSolo(false);
     setView('creating');
     setErrorMsg('');
-    const id = `CAR-${Math.random().toString(36).substring(2, 8).toUpperCase()}`; // Ej. CAR-A1B2C3
-    
-    // Depender de los servidores STUN por defecto de PeerJS para mejorar compatibilidad con WebRTC NAT
-    const peer = new Peer(id);
-    
+    const code = generateRoomCode();
+    const peerId = toHostPeerId(code);
+
+    // PeerJS con broker + iceServers frescos del backend (fallback a defaults).
+    const options = await buildPeerOptions();
+    const peer = new Peer(peerId, options);
+
     peer.on('open', (assignedId) => {
-      setRoomId(assignedId);
+      // Mostramos al usuario solo el código (6 chars) sin el prefijo interno.
+      setRoomId(code);
       myIdRef.current = assignedId;
       setLobbyPlayers([assignedId]);
-      
+
       // Host asigna su propio nombre
       playerNamesRef.current[assignedId] = playerNameRef.current;
       setPlayerNames({...playerNamesRef.current});
-      
+
       setView('room_lobby');
     });
 
@@ -255,8 +342,12 @@ export default function App() {
       setupConnection(conn);
     });
 
-    peer.on('error', (err) => {
-      setErrorMsg("Error al crear: " + err.message);
+    peer.on('error', (err: any) => {
+      if (err && err.type === 'unavailable-id') {
+        setErrorMsg('Código en uso. Vuelve a crear la sala.');
+      } else {
+        setErrorMsg('Error al crear: ' + (err?.message ?? 'desconocido'));
+      }
       setView('lobby');
     });
 
@@ -264,40 +355,50 @@ export default function App() {
     isHost.current = true;
   };
 
-  const joinRoom = () => {
-    if (!joinId) return;
+  const joinRoom = async () => {
+    const code = normalizeRoomCode(joinId);
+    if (code.length !== ROOM_CODE_LENGTH) {
+      setErrorMsg(`El código debe tener ${ROOM_CODE_LENGTH} caracteres.`);
+      return;
+    }
     setIsSolo(false);
     setIsConnecting(true);
     setErrorMsg('');
-    
-    let connectionTimeout: any = null;
 
-    // Conectar usando el servidor de señales por defecto
-    const peer = new Peer();
-    
+    let connectionTimeout: any = null;
+    const hostPeerId = toHostPeerId(code);
+
+    // PeerJS con iceServers frescos; guest recibe un id anónimo del broker.
+    const options = await buildPeerOptions();
+    const peer = new Peer(undefined as unknown as string, options);
+
     peer.on('open', (id) => {
       myIdRef.current = id;
-      // Usar canales no fiables pero veloces (estándar juego online). No forzamos reliable: true.
-      const conn = peer.connect(joinId);
-      
+      // Canales no fiables/veloces (default). No forzamos reliable: true.
+      const conn = peer.connect(hostPeerId);
+
       // Fallback timeout in case WebRTC negotiation hangs indefinitely
       connectionTimeout = setTimeout(() => {
           setIsConnecting(false);
-          setErrorMsg("Tiempo de espera agotado. Asegúrate de que el Host sigue activo y usad redes compatibles.");
+          setErrorMsg('Tiempo de espera agotado. Asegúrate de que el Host sigue activo y usad redes compatibles.');
           setView('lobby');
           peer.destroy();
       }, 15000);
-      
+
       conn.on('open', () => clearTimeout(connectionTimeout));
-      
+
       connsRef.current.set(conn.peer, conn);
       setupConnection(conn);
     });
 
-    peer.on('error', (err) => {
+    peer.on('error', (err: any) => {
       if (connectionTimeout) clearTimeout(connectionTimeout);
       setIsConnecting(false);
-      setErrorMsg(`Error al unirse (${err.type}): ${err.message}`);
+      if (err && err.type === 'peer-unavailable') {
+        setErrorMsg(`No hay ninguna sala con código ${code}.`);
+      } else {
+        setErrorMsg(`Error al unirse (${err?.type ?? 'desconocido'}): ${err?.message ?? ''}`);
+      }
       setView('lobby');
     });
 
@@ -1053,12 +1154,13 @@ export default function App() {
                             <h2 className="text-2xl font-bold mb-8 tracking-widest text-zinc-100 uppercase">Conexión Remota</h2>
                             <div className="w-full relative">
                                 <span className="absolute -top-3 left-3 bg-[#0f0f12] px-2 text-xs font-mono text-[#00f3ff] tracking-widest">ID DE ENLACE</span>
-                                <input 
-                                    type="text" 
-                                    value={joinId} 
-                                    onChange={e => setJoinId(e.target.value.toUpperCase().trim())} 
-                                    placeholder="CAR-XXX" 
-                                    className="w-full text-center px-4 py-5 text-3xl bg-black/40 text-[#00f3ff] font-mono font-bold border-2 border-zinc-700 outline-none uppercase transition focus:border-[#00f3ff] focus:shadow-[0_0_15px_rgba(0,243,255,0.3)] placeholder-zinc-700" 
+                                <input
+                                    type="text"
+                                    value={joinId}
+                                    onChange={e => setJoinId(normalizeRoomCode(e.target.value))}
+                                    maxLength={ROOM_CODE_LENGTH}
+                                    placeholder="XXXXXX"
+                                    className="w-full text-center px-4 py-5 text-3xl bg-black/40 text-[#00f3ff] font-mono font-bold border-2 border-zinc-700 outline-none uppercase transition focus:border-[#00f3ff] focus:shadow-[0_0_15px_rgba(0,243,255,0.3)] placeholder-zinc-700 tracking-[0.4em]"
                                 />
                             </div>
                             <div className="flex gap-4 w-full mt-8">
