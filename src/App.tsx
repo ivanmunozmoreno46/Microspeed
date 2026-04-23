@@ -2,58 +2,33 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Peer, DataConnection, PeerOptions } from 'peerjs';
 
 // =========================================================
-// 0. CONFIGURACIÓN DE RED (ICE: STUN + TURN)
+// 0. CONFIGURACIÓN DE RED (PeerJS)
 // =========================================================
-// El modo online fuera de la LAN exige un servidor TURN: los STUN por sí solos
-// no atraviesan CGNAT, operadores móviles ni firewalls restrictivos. Por defecto
-// se usa el relay público gratuito de Metered OpenRelay (rate-limited pero
-// suficiente para demos). Para producción se puede sobrescribir con:
-//   VITE_TURN_URL          -> lista separada por comas (turn:host:port?transport=udp, turns:..., etc.)
-//   VITE_TURN_USERNAME
-//   VITE_TURN_CREDENTIAL
-const metaEnv: Record<string, string | undefined> = (import.meta as any).env ?? {};
-const customTurnUrl = metaEnv.VITE_TURN_URL;
-const customTurnUsername = metaEnv.VITE_TURN_USERNAME;
-const customTurnCredential = metaEnv.VITE_TURN_CREDENTIAL;
+// Replicamos el enfoque de PlayHubGX: usamos PeerJS con sus defaults (broker
+// + STUN/TURN públicos que trae la librería) sin tocar iceServers. El id del
+// host va prefijado (`microspeed-room-<CODE>`) para namespacing en el broker
+// compartido y evitar colisiones con otras apps que usan PeerJS Cloud.
+const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin O/0/1/I/L ambiguos
+const PEER_ID_PREFIX = 'microspeed-room-';
+const ROOM_CODE_LENGTH = 6;
 
-const iceServers: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
-];
+const PEER_OPTIONS: PeerOptions = { debug: 2 };
 
-if (customTurnUrl && customTurnUsername && customTurnCredential) {
-  iceServers.push({
-    urls: customTurnUrl.split(',').map(s => s.trim()).filter(Boolean),
-    username: customTurnUsername,
-    credential: customTurnCredential,
-  });
-} else {
-  // Fallbacks públicos (sin registro). Son poco fiables y están rate-limited;
-  // para uso real conviene definir VITE_TURN_* apuntando a TURN propio.
-  // 1) TURN por defecto que trae PeerJS (Heroku, user peerjs/peerjsp). Va sobre
-  //    TCP 3478: útil cuando los firewalls dejan solo HTTP/HTTPS fuera.
-  iceServers.push({
-    urls: [
-      'turn:eu-0.turn.peerjs.com:3478',
-      'turn:us-0.turn.peerjs.com:3478',
-    ],
-    username: 'peerjs',
-    credential: 'peerjsp',
-  });
-  // 2) OpenRelay Metered (histórico, el puerto 443 puede estar caído; lo dejamos
-  //    como último recurso detrás del TURN de PeerJS).
-  iceServers.push({
-    urls: [
-      'turn:openrelay.metered.ca:80',
-      'turn:openrelay.metered.ca:443',
-      'turn:openrelay.metered.ca:443?transport=tcp',
-    ],
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  });
+function generateRoomCode(): string {
+  let code = '';
+  for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
+    code += ROOM_CODE_CHARS[Math.floor(Math.random() * ROOM_CODE_CHARS.length)];
+  }
+  return code;
 }
 
-const PEER_OPTIONS: PeerOptions = { config: { iceServers } };
+function toHostPeerId(code: string): string {
+  return `${PEER_ID_PREFIX}${code.toUpperCase()}`;
+}
+
+function normalizeRoomCode(raw: string): string {
+  return String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, ROOM_CODE_LENGTH);
+}
 
 // =========================================================
 // 1. CONFIGURACIÓN DEL CIRCUITO
@@ -287,20 +262,23 @@ export default function App() {
     setIsSolo(false);
     setView('creating');
     setErrorMsg('');
-    const id = `CAR-${Math.random().toString(36).substring(2, 8).toUpperCase()}`; // Ej. CAR-A1B2C3
-    
-    // Config ICE (STUN + TURN) para funcionar fuera de LAN. Ver PEER_OPTIONS arriba.
-    const peer = new Peer(id, PEER_OPTIONS);
-    
+    const code = generateRoomCode();
+    const peerId = toHostPeerId(code);
+
+    // PeerJS con defaults (broker + STUN/TURN gratuitos de la librería). Mismo
+    // setup que usa PlayHubGX.
+    const peer = new Peer(peerId, PEER_OPTIONS);
+
     peer.on('open', (assignedId) => {
-      setRoomId(assignedId);
+      // Mostramos al usuario solo el código (6 chars) sin el prefijo interno.
+      setRoomId(code);
       myIdRef.current = assignedId;
       setLobbyPlayers([assignedId]);
-      
+
       // Host asigna su propio nombre
       playerNamesRef.current[assignedId] = playerNameRef.current;
       setPlayerNames({...playerNamesRef.current});
-      
+
       setView('room_lobby');
     });
 
@@ -309,8 +287,12 @@ export default function App() {
       setupConnection(conn);
     });
 
-    peer.on('error', (err) => {
-      setErrorMsg("Error al crear: " + err.message);
+    peer.on('error', (err: any) => {
+      if (err && err.type === 'unavailable-id') {
+        setErrorMsg('Código en uso. Vuelve a crear la sala.');
+      } else {
+        setErrorMsg('Error al crear: ' + (err?.message ?? 'desconocido'));
+      }
       setView('lobby');
     });
 
@@ -319,39 +301,48 @@ export default function App() {
   };
 
   const joinRoom = () => {
-    if (!joinId) return;
+    const code = normalizeRoomCode(joinId);
+    if (code.length !== ROOM_CODE_LENGTH) {
+      setErrorMsg(`El código debe tener ${ROOM_CODE_LENGTH} caracteres.`);
+      return;
+    }
     setIsSolo(false);
     setIsConnecting(true);
     setErrorMsg('');
-    
-    let connectionTimeout: any = null;
 
-    // Config ICE (STUN + TURN) para funcionar fuera de LAN. Ver PEER_OPTIONS arriba.
+    let connectionTimeout: any = null;
+    const hostPeerId = toHostPeerId(code);
+
+    // PeerJS con defaults; guest recibe un id anónimo del broker.
     const peer = new Peer(undefined as unknown as string, PEER_OPTIONS);
-    
+
     peer.on('open', (id) => {
       myIdRef.current = id;
-      // Usar canales no fiables pero veloces (estándar juego online). No forzamos reliable: true.
-      const conn = peer.connect(joinId);
-      
+      // Canales no fiables/veloces (default). No forzamos reliable: true.
+      const conn = peer.connect(hostPeerId);
+
       // Fallback timeout in case WebRTC negotiation hangs indefinitely
       connectionTimeout = setTimeout(() => {
           setIsConnecting(false);
-          setErrorMsg("Tiempo de espera agotado. Asegúrate de que el Host sigue activo y usad redes compatibles.");
+          setErrorMsg('Tiempo de espera agotado. Asegúrate de que el Host sigue activo y usad redes compatibles.');
           setView('lobby');
           peer.destroy();
       }, 15000);
-      
+
       conn.on('open', () => clearTimeout(connectionTimeout));
-      
+
       connsRef.current.set(conn.peer, conn);
       setupConnection(conn);
     });
 
-    peer.on('error', (err) => {
+    peer.on('error', (err: any) => {
       if (connectionTimeout) clearTimeout(connectionTimeout);
       setIsConnecting(false);
-      setErrorMsg(`Error al unirse (${err.type}): ${err.message}`);
+      if (err && err.type === 'peer-unavailable') {
+        setErrorMsg(`No hay ninguna sala con código ${code}.`);
+      } else {
+        setErrorMsg(`Error al unirse (${err?.type ?? 'desconocido'}): ${err?.message ?? ''}`);
+      }
       setView('lobby');
     });
 
@@ -1107,12 +1098,13 @@ export default function App() {
                             <h2 className="text-2xl font-bold mb-8 tracking-widest text-zinc-100 uppercase">Conexión Remota</h2>
                             <div className="w-full relative">
                                 <span className="absolute -top-3 left-3 bg-[#0f0f12] px-2 text-xs font-mono text-[#00f3ff] tracking-widest">ID DE ENLACE</span>
-                                <input 
-                                    type="text" 
-                                    value={joinId} 
-                                    onChange={e => setJoinId(e.target.value.toUpperCase().trim())} 
-                                    placeholder="CAR-XXX" 
-                                    className="w-full text-center px-4 py-5 text-3xl bg-black/40 text-[#00f3ff] font-mono font-bold border-2 border-zinc-700 outline-none uppercase transition focus:border-[#00f3ff] focus:shadow-[0_0_15px_rgba(0,243,255,0.3)] placeholder-zinc-700" 
+                                <input
+                                    type="text"
+                                    value={joinId}
+                                    onChange={e => setJoinId(normalizeRoomCode(e.target.value))}
+                                    maxLength={ROOM_CODE_LENGTH}
+                                    placeholder="XXXXXX"
+                                    className="w-full text-center px-4 py-5 text-3xl bg-black/40 text-[#00f3ff] font-mono font-bold border-2 border-zinc-700 outline-none uppercase transition focus:border-[#00f3ff] focus:shadow-[0_0_15px_rgba(0,243,255,0.3)] placeholder-zinc-700 tracking-[0.4em]"
                                 />
                             </div>
                             <div className="flex gap-4 w-full mt-8">

@@ -20,7 +20,7 @@ El `package.json` está todavía con el nombre genérico `react-example` (scaffo
 
 - **Frontend:** React 19 + Vite 6 + TypeScript 5.8 + Tailwind CSS 4 (vía `@tailwindcss/vite`, sin `tailwind.config.js`; el tema se define con `@theme { ... }` dentro de `src/index.css`).
 - **Render:** Canvas 2D a pantalla completa (`windowSize.width × windowSize.height`), cámara centrada en el coche local, zoom `0.65` en móvil y `1.0` en desktop.
-- **Multijugador:** **PeerJS** (WebRTC P2P) con los signaling/STUN por defecto de PeerJS. El host genera un id legible `CAR-XXXXXX` y los clientes se conectan usando ese id.
+- **Multijugador:** **PeerJS** (WebRTC P2P) con sus defaults (broker + STUN/TURN gratuitos de la librería), mismo enfoque que PlayHubGX. El host abre un peer con id prefijado `microspeed-room-<CODE>` (`<CODE>` = 6 chars de `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, sin letras ambiguas). En la UI solo se muestra `<CODE>`; el prefijo sirve para namespacing en el broker compartido de PeerJS.
 - **Input:** Teclado (flechas + espacio), Gamepad API (D-pad, stick izquierdo, botones A/B, gatillos L2/R2, Start) y joystick virtual en pantalla para móvil.
 - **Dependencias runtime destacadas:** `react`, `react-dom`, `peerjs`, `motion`, `lucide-react`. También aparecen `@google/genai`, `express` y `dotenv` — son herencia del template de AI Studio y **no se usan** en el código actual (ver §7).
 - **Node:** ≥18, **npm:** ≥9 (no fijado, pero implícito por Vite 6 y React 19).
@@ -63,14 +63,14 @@ No hay tests automatizados ni CI configurados. `npm run lint` hace solo typechec
 
 - **lobby**: input de nombre (`playerName`, autogenerado como `Piloto-NNNN`) y tres botones: `Contrarreloj` (solo), `Crear Sala`, `Unirse a Sala`.
 - **creating**: spinner mientras `Peer.on('open')` devuelve el id.
-- **joining**: formulario para meter el id `CAR-XXXXXX` del host. Hay un timeout de **15 s** por si la negociación WebRTC se cuelga.
+- **joining**: formulario para meter el código `XXXXXX` (6 chars) que da el host. Hay un timeout de **15 s** por si la negociación WebRTC se cuelga.
 - **room_lobby**: muestra el id de sala, la lista de pilotos (hasta 7 slots) y — solo para el host — un botón "Iniciar Secuencia" que manda `{ type: 'start_race' }` a todos.
 - **playing**: render del canvas + controles.
 
 ### 5.2 Red (PeerJS)
 
-- **Host:** `createRoom()` abre un `Peer("CAR-XXXXXX")`. Acepta conexiones entrantes y mantiene un `connsRef: Map<peerId, DataConnection>`.
-- **Cliente:** `joinRoom()` abre un `Peer()` anónimo y llama `peer.connect(joinId)`.
+- **Host:** `createRoom()` genera un código `CODE` de 6 chars (alfabeto sin ambiguos) y abre un `Peer("microspeed-room-"+CODE, { debug: 2 })`. Acepta conexiones entrantes y mantiene un `connsRef: Map<peerId, DataConnection>`. La UI muestra solo `CODE` al usuario.
+- **Cliente:** `joinRoom()` normaliza el código escrito, reconstruye el peer id `microspeed-room-<CODE>` y abre un `Peer(undefined, { debug: 2 })` anónimo que llama `peer.connect(hostPeerId)`. Errores `peer-unavailable` se traducen en "no hay ninguna sala con código X".
 - **Handshake:** al abrir una conexión, el cliente envía `{ type: 'hello', name }`. El host registra el nombre en `playerNamesRef` y reemite el lobby completo con `{ type: 'lobby_sync', players, names }` a todo el mundo.
 - **Mensajes definidos:**
   - `hello` → cliente → host, lleva el nickname.
