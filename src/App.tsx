@@ -22,7 +22,13 @@ const PEER_ID_PREFIX = 'microspeed-room-';
 const ROOM_CODE_LENGTH = 6;
 
 const metaEnv: Record<string, string | undefined> = (import.meta as any).env ?? {};
-const turnServerUrl = (metaEnv.VITE_TURN_SERVER_URL || '').replace(/\/+$/, '');
+// URL del backend que mintea credenciales TURN frescas. Hardcodeamos como
+// default la instancia pública en Fly.io para que el juego funcione en
+// cualquier deploy (Vercel, preview devinapps, self-host) sin tener que
+// configurar variables de entorno. Se puede sobreescribir a otro backend
+// definiendo `VITE_TURN_SERVER_URL` al build.
+const DEFAULT_TURN_SERVER_URL = 'https://microspeed-turn-serve-xefgnrtb.fly.dev';
+const turnServerUrl = (metaEnv.VITE_TURN_SERVER_URL || DEFAULT_TURN_SERVER_URL).replace(/\/+$/, '');
 const staticTurnUrl = metaEnv.VITE_TURN_URL;
 const staticTurnUsername = metaEnv.VITE_TURN_USERNAME;
 const staticTurnCredential = metaEnv.VITE_TURN_CREDENTIAL;
