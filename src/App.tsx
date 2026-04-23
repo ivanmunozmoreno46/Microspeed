@@ -85,6 +85,32 @@ function normalizeRoomCode(raw: string): string {
   return String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, ROOM_CODE_LENGTH);
 }
 
+// Logo SVG: mismo contorno que la nave naranja (solo) del juego (ver `drawCar`
+// en el bucle de render). Se dibuja con el naranja `#f27d26` del tema y un
+// reflejo de cabina cian.
+function ShipLogo({ className = '' }: { className?: string }) {
+  return (
+    <svg
+      viewBox="-12 -9 28 18"
+      className={className}
+      aria-hidden="true"
+      focusable="false"
+    >
+      <polygon
+        points="14,0 -10,7 -5,0 -10,-7"
+        fill="#1c1c20"
+        stroke="#f27d26"
+        strokeWidth="1.2"
+        strokeLinejoin="round"
+      />
+      <polygon
+        points="5,0 -3.33,2.5 -1.33,0 -3.33,-2.5"
+        fill="rgba(0, 243, 255, 0.55)"
+      />
+    </svg>
+  );
+}
+
 // =========================================================
 // 1. CONFIGURACIÓN DEL CIRCUITO
 // =========================================================
@@ -475,13 +501,25 @@ export default function App() {
 
     const canvas = canvasRef.current;
     if (!canvas) return;
-    
-    // Ajustar resolución del canvas al tamaño real de la ventana
-    canvas.width = windowSize.width;
-    canvas.height = windowSize.height;
+
+    // Ajustar resolución del canvas teniendo en cuenta el devicePixelRatio
+    // para que en pantallas Retina / móviles de alta densidad el render no
+    // se vea pixelado. Clamp a 2 para no penalizar demasiado la CPU/GPU en
+    // teléfonos con DPR=3+.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssW = windowSize.width;
+    const cssH = windowSize.height;
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    canvas.style.width = `${cssW}px`;
+    canvas.style.height = `${cssH}px`;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    // Trabajamos en píxeles lógicos (CSS): todo lo que sigue dibuja en
+    // coordenadas `cssW x cssH`, y el backing store de mayor resolución
+    // nos da la nitidez.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Inicializar o recuperar estado del juego
     if (!gameStateRef.current) {
@@ -854,11 +892,14 @@ export default function App() {
        }
 
        // --- RENDERIZADO EN CANVAS ---
-       ctx.fillStyle = "#1e1e24"; ctx.fillRect(0, 0, canvas.width, canvas.height); 
-       
-       const zoomFactor = windowSize.width < 768 ? 0.65 : 1.0;
-       const viewW = canvas.width / zoomFactor;
-       const viewH = canvas.height / zoomFactor;
+       // Reasentamos la transform por si algo la tocó en el frame anterior;
+       // `cssW x cssH` son nuestras coordenadas lógicas.
+       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+       ctx.fillStyle = "#1e1e24"; ctx.fillRect(0, 0, cssW, cssH);
+
+       const zoomFactor = cssW < 768 ? 0.65 : 1.0;
+       const viewW = cssW / zoomFactor;
+       const viewH = cssH / zoomFactor;
 
        ctx.save();
        ctx.scale(zoomFactor, zoomFactor);
@@ -979,12 +1020,12 @@ export default function App() {
        ctx.textAlign = "right"; ctx.fillStyle = car.color;
        if (isMobile) {
            ctx.font = "bold 28px monospace";
-           ctx.fillText(`${Math.min(gs.localLap, TOTAL_LAPS)}/${TOTAL_LAPS}`, canvas.width - 20, 35);
+           ctx.fillText(`${Math.min(gs.localLap, TOTAL_LAPS)}/${TOTAL_LAPS}`, cssW - 20, 35);
            ctx.font = "bold 12px monospace";
-           ctx.fillText("VUELTA", canvas.width - 20, 58);
+           ctx.fillText("VUELTA", cssW - 20, 58);
        } else {
            ctx.font = "bold 24px monospace";
-           ctx.fillText(`VUELTA: ${Math.min(gs.localLap, TOTAL_LAPS)}/${TOTAL_LAPS}`, canvas.width - 20, 35);
+           ctx.fillText(`VUELTA: ${Math.min(gs.localLap, TOTAL_LAPS)}/${TOTAL_LAPS}`, cssW - 20, 35);
        }
        if (!isSolo) {
            ctx.font = isMobile ? "bold 12px monospace" : "bold 16px monospace"; 
@@ -992,7 +1033,7 @@ export default function App() {
            Object.entries(gs.remoteCars).forEach(([id, rcar]: [string, any]) => {
                 const rawName = playerNamesRef.current[id] || "RIVAL";
                 const dName = rawName.length > 10 ? rawName.substring(0, 10) + '...' : rawName;
-                ctx.fillStyle = rcar.color; ctx.fillText(`${dName}: ${Math.min(rcar.lap, TOTAL_LAPS)}/${TOTAL_LAPS}`, canvas.width - 20, yOffset); yOffset += isMobile ? 15 : 20;
+                ctx.fillStyle = rcar.color; ctx.fillText(`${dName}: ${Math.min(rcar.lap, TOTAL_LAPS)}/${TOTAL_LAPS}`, cssW - 20, yOffset); yOffset += isMobile ? 15 : 20;
            });
        }
        ctx.textAlign = "center";
@@ -1004,10 +1045,10 @@ export default function App() {
        if (gs.uiMessage) {
            ctx.font = "900 48px sans-serif"; ctx.fillStyle = (gs.uiMessage.includes("GANADO") || gs.uiMessage.includes("GO")) ? "#00ff00" : (gs.uiMessage.includes("PERDIDO") ? "#ef4444" : "#ffffff");
            // Eliminado shadowBlur para rendimiento
-           ctx.fillText(gs.uiMessage.toUpperCase(), canvas.width / 2, canvas.height / 2);
+           ctx.fillText(gs.uiMessage.toUpperCase(), cssW / 2, cssH / 2);
            if (gs.mode === "finished") {
-               ctx.font = "bold 24px sans-serif"; ctx.fillStyle = "#e0e0e0"; ctx.fillText(`Tiempo total: ${(gs.lapTime / 1000).toFixed(2)}s`, canvas.width / 2, canvas.height / 2 + 50);
-               ctx.font = "16px sans-serif"; ctx.fillText("Presiona ESPACIO para jugar de nuevo", canvas.width / 2, canvas.height / 2 + 90);
+               ctx.font = "bold 24px sans-serif"; ctx.fillStyle = "#e0e0e0"; ctx.fillText(`Tiempo total: ${(gs.lapTime / 1000).toFixed(2)}s`, cssW / 2, cssH / 2 + 50);
+               ctx.font = "16px sans-serif"; ctx.fillText("Presiona ESPACIO para jugar de nuevo", cssW / 2, cssH / 2 + 90);
            }
        }
        animationFrameId = requestAnimationFrame(gameLoop);
@@ -1027,10 +1068,13 @@ export default function App() {
     <div className="flex flex-col items-center justify-center w-screen h-screen overflow-hidden m-0 p-0 font-sans" style={{ backgroundColor: '#09090b' }}>
         
         {view !== 'playing' && (
-           <div className="absolute top-12 flex flex-col items-center z-10 pointer-events-none">
-               <h1 className="text-4xl md:text-6xl font-black mb-1 tracking-tighter text-transparent bg-clip-text bg-gradient-to-r from-[#00f3ff] to-[#f27d26] uppercase drop-shadow-lg" style={{ fontFamily: 'Space Grotesk' }}>
-                   Microspeed
-               </h1>
+           <div className="absolute top-10 md:top-12 flex flex-col items-center z-10 pointer-events-none">
+               <div className="flex items-center gap-3 md:gap-5">
+                   <ShipLogo className="w-14 md:w-24 h-auto drop-shadow-[0_0_12px_rgba(242,125,38,0.55)]" />
+                   <h1 className="text-4xl md:text-6xl font-black mb-1 tracking-tighter text-transparent bg-clip-text bg-gradient-to-r from-[#00f3ff] to-[#f27d26] uppercase drop-shadow-lg" style={{ fontFamily: 'Space Grotesk' }}>
+                       Microspeed
+                   </h1>
+               </div>
                <div className="text-[#00f3ff] tracking-[0.5em] font-bold text-sm md:text-lg uppercase glow-text-cyan">Online</div>
            </div>
         )}
