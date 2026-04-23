@@ -1,5 +1,47 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Peer, DataConnection } from 'peerjs';
+import { Peer, DataConnection, PeerOptions } from 'peerjs';
+
+// =========================================================
+// 0. CONFIGURACIÓN DE RED (ICE: STUN + TURN)
+// =========================================================
+// El modo online fuera de la LAN exige un servidor TURN: los STUN por sí solos
+// no atraviesan CGNAT, operadores móviles ni firewalls restrictivos. Por defecto
+// se usa el relay público gratuito de Metered OpenRelay (rate-limited pero
+// suficiente para demos). Para producción se puede sobrescribir con:
+//   VITE_TURN_URL          -> lista separada por comas (turn:host:port?transport=udp, turns:..., etc.)
+//   VITE_TURN_USERNAME
+//   VITE_TURN_CREDENTIAL
+const metaEnv: Record<string, string | undefined> = (import.meta as any).env ?? {};
+const customTurnUrl = metaEnv.VITE_TURN_URL;
+const customTurnUsername = metaEnv.VITE_TURN_USERNAME;
+const customTurnCredential = metaEnv.VITE_TURN_CREDENTIAL;
+
+const iceServers: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:global.stun.twilio.com:3478' },
+];
+
+if (customTurnUrl && customTurnUsername && customTurnCredential) {
+  iceServers.push({
+    urls: customTurnUrl.split(',').map(s => s.trim()).filter(Boolean),
+    username: customTurnUsername,
+    credential: customTurnCredential,
+  });
+} else {
+  // Fallback público (sin registro). Si algún día se cae, basta con apuntar las
+  // env vars a Twilio/Cloudflare Realtime/Xirsys/coturn propio.
+  iceServers.push({
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:443',
+      'turn:openrelay.metered.ca:443?transport=tcp',
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  });
+}
+
+const PEER_OPTIONS: PeerOptions = { config: { iceServers } };
 
 // =========================================================
 // 1. CONFIGURACIÓN DEL CIRCUITO
@@ -235,8 +277,8 @@ export default function App() {
     setErrorMsg('');
     const id = `CAR-${Math.random().toString(36).substring(2, 8).toUpperCase()}`; // Ej. CAR-A1B2C3
     
-    // Depender de los servidores STUN por defecto de PeerJS para mejorar compatibilidad con WebRTC NAT
-    const peer = new Peer(id);
+    // Config ICE (STUN + TURN) para funcionar fuera de LAN. Ver PEER_OPTIONS arriba.
+    const peer = new Peer(id, PEER_OPTIONS);
     
     peer.on('open', (assignedId) => {
       setRoomId(assignedId);
@@ -272,8 +314,8 @@ export default function App() {
     
     let connectionTimeout: any = null;
 
-    // Conectar usando el servidor de señales por defecto
-    const peer = new Peer();
+    // Config ICE (STUN + TURN) para funcionar fuera de LAN. Ver PEER_OPTIONS arriba.
+    const peer = new Peer(undefined as unknown as string, PEER_OPTIONS);
     
     peer.on('open', (id) => {
       myIdRef.current = id;
