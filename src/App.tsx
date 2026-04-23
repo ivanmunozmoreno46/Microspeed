@@ -4,15 +4,70 @@ import { Peer, DataConnection, PeerOptions } from 'peerjs';
 // =========================================================
 // 0. CONFIGURACIÓN DE RED (PeerJS)
 // =========================================================
-// Replicamos el enfoque de PlayHubGX: usamos PeerJS con sus defaults (broker
-// + STUN/TURN públicos que trae la librería) sin tocar iceServers. El id del
-// host va prefijado (`microspeed-room-<CODE>`) para namespacing en el broker
-// compartido y evitar colisiones con otras apps que usan PeerJS Cloud.
+// Base del enfoque (inspirado en PlayHubGX): PeerJS con sus defaults (broker
+// + STUN/TURN públicos que trae la librería) y un peer id del host con
+// prefijo (`microspeed-room-<CODE>`) para namespacing en el broker compartido.
+//
+// Encima de esa base, para atravesar CGNAT / 5G de forma fiable, pedimos
+// credenciales TURN frescas a nuestro backend `VITE_TURN_SERVER_URL` en el
+// arranque (endpoint `GET /ice-servers`). El backend mantiene el API Token
+// de Cloudflare Realtime a buen recaudo y devuelve credenciales efímeras que
+// caducan solas; el cliente solo ve el par usuario/credencial ya caducable.
+//
+// Fallbacks: si `VITE_TURN_SERVER_URL` está vacío o falla la llamada, se usan
+// las variables estáticas `VITE_TURN_URL/USERNAME/CREDENTIAL` si existen, y
+// si tampoco hay nada se confía en los defaults de PeerJS.
 const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin O/0/1/I/L ambiguos
 const PEER_ID_PREFIX = 'microspeed-room-';
 const ROOM_CODE_LENGTH = 6;
 
-const PEER_OPTIONS: PeerOptions = { debug: 2 };
+const metaEnv: Record<string, string | undefined> = (import.meta as any).env ?? {};
+const turnServerUrl = (metaEnv.VITE_TURN_SERVER_URL || '').replace(/\/+$/, '');
+const staticTurnUrl = metaEnv.VITE_TURN_URL;
+const staticTurnUsername = metaEnv.VITE_TURN_USERNAME;
+const staticTurnCredential = metaEnv.VITE_TURN_CREDENTIAL;
+
+const staticIceServers: RTCIceServer[] = [];
+if (staticTurnUrl && staticTurnUsername && staticTurnCredential) {
+  staticIceServers.push({ urls: 'stun:stun.l.google.com:19302' });
+  staticIceServers.push({
+    urls: staticTurnUrl.split(',').map((s) => s.trim()).filter(Boolean),
+    username: staticTurnUsername,
+    credential: staticTurnCredential,
+  });
+}
+
+let iceServersPromise: Promise<RTCIceServer[] | null> | null = null;
+
+function fetchIceServers(): Promise<RTCIceServer[] | null> {
+  if (iceServersPromise) return iceServersPromise;
+  if (!turnServerUrl) {
+    iceServersPromise = Promise.resolve(staticIceServers.length ? staticIceServers : null);
+    return iceServersPromise;
+  }
+  iceServersPromise = fetch(`${turnServerUrl}/ice-servers`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((payload: any) => {
+      const list = payload?.iceServers;
+      if (Array.isArray(list) && list.length > 0) return list as RTCIceServer[];
+      return staticIceServers.length ? staticIceServers : null;
+    })
+    .catch(() => (staticIceServers.length ? staticIceServers : null));
+  return iceServersPromise;
+}
+
+async function buildPeerOptions(): Promise<PeerOptions> {
+  const options: PeerOptions = { debug: 2 };
+  const ice = await fetchIceServers();
+  if (ice && ice.length > 0) {
+    options.config = { iceServers: ice };
+  }
+  return options;
+}
+
+// Kick off fetch as early as possible so the user doesn't wait on it when
+// clicking "Crear Sala" / "Unirse a Sala".
+fetchIceServers();
 
 function generateRoomCode(): string {
   let code = '';
@@ -258,16 +313,16 @@ export default function App() {
     setErrorMsg('');
   };
 
-  const createRoom = () => {
+  const createRoom = async () => {
     setIsSolo(false);
     setView('creating');
     setErrorMsg('');
     const code = generateRoomCode();
     const peerId = toHostPeerId(code);
 
-    // PeerJS con defaults (broker + STUN/TURN gratuitos de la librería). Mismo
-    // setup que usa PlayHubGX.
-    const peer = new Peer(peerId, PEER_OPTIONS);
+    // PeerJS con broker + iceServers frescos del backend (fallback a defaults).
+    const options = await buildPeerOptions();
+    const peer = new Peer(peerId, options);
 
     peer.on('open', (assignedId) => {
       // Mostramos al usuario solo el código (6 chars) sin el prefijo interno.
@@ -300,7 +355,7 @@ export default function App() {
     isHost.current = true;
   };
 
-  const joinRoom = () => {
+  const joinRoom = async () => {
     const code = normalizeRoomCode(joinId);
     if (code.length !== ROOM_CODE_LENGTH) {
       setErrorMsg(`El código debe tener ${ROOM_CODE_LENGTH} caracteres.`);
@@ -313,8 +368,9 @@ export default function App() {
     let connectionTimeout: any = null;
     const hostPeerId = toHostPeerId(code);
 
-    // PeerJS con defaults; guest recibe un id anónimo del broker.
-    const peer = new Peer(undefined as unknown as string, PEER_OPTIONS);
+    // PeerJS con iceServers frescos; guest recibe un id anónimo del broker.
+    const options = await buildPeerOptions();
+    const peer = new Peer(undefined as unknown as string, options);
 
     peer.on('open', (id) => {
       myIdRef.current = id;

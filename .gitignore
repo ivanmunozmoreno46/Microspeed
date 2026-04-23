@@ -6,3 +6,10 @@ dist/
 .DS_Store
 *.log
 .vite/
+
+# Local-only backend secrets (baked into Docker image on deploy, never in git).
+server/turn_config.json
+server/.venv/
+server/*.egg-info/
+server/__pycache__/
+server/app/__pycache__/

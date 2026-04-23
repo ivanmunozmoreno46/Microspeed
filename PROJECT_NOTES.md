@@ -20,7 +20,7 @@ El `package.json` está todavía con el nombre genérico `react-example` (scaffo
 
 - **Frontend:** React 19 + Vite 6 + TypeScript 5.8 + Tailwind CSS 4 (vía `@tailwindcss/vite`, sin `tailwind.config.js`; el tema se define con `@theme { ... }` dentro de `src/index.css`).
 - **Render:** Canvas 2D a pantalla completa (`windowSize.width × windowSize.height`), cámara centrada en el coche local, zoom `0.65` en móvil y `1.0` en desktop.
-- **Multijugador:** **PeerJS** (WebRTC P2P) con sus defaults (broker + STUN/TURN gratuitos de la librería), mismo enfoque que PlayHubGX. El host abre un peer con id prefijado `microspeed-room-<CODE>` (`<CODE>` = 6 chars de `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, sin letras ambiguas). En la UI solo se muestra `<CODE>`; el prefijo sirve para namespacing en el broker compartido de PeerJS.
+- **Multijugador:** **PeerJS** (WebRTC P2P). Broker por defecto y peer id del host prefijado `microspeed-room-<CODE>` (`<CODE>` = 6 chars de `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, sin letras ambiguas). En la UI solo se muestra `<CODE>`; el prefijo es namespacing para el broker compartido de PeerJS. El `iceServers` se obtiene al arrancar desde un **backend propio** (`server/`, FastAPI en Fly.io) que mintea credenciales **efímeras de Cloudflare Realtime TURN** vía su API. Así las credenciales caducan solas y nunca se bakean en el build.
 - **Input:** Teclado (flechas + espacio), Gamepad API (D-pad, stick izquierdo, botones A/B, gatillos L2/R2, Start) y joystick virtual en pantalla para móvil.
 - **Dependencias runtime destacadas:** `react`, `react-dom`, `peerjs`, `motion`, `lucide-react`. También aparecen `@google/genai`, `express` y `dotenv` — son herencia del template de AI Studio y **no se usan** en el código actual (ver §7).
 - **Node:** ≥18, **npm:** ≥9 (no fijado, pero implícito por Vite 6 y React 19).
@@ -48,11 +48,17 @@ No hay tests automatizados ni CI configurados. `npm run lint` hace solo typechec
 ├── vite.config.ts
 ├── metadata.json                # meta de AI Studio
 ├── README.md                    # scaffold genérico de AI Studio (ver §7)
-└── src/
-    ├── main.tsx                 # entry point (StrictMode + createRoot)
-    ├── index.css                # Tailwind + tema + clases utilitarias (hud-panel, btn-sci-fi, glow-*)
-    └── App.tsx                  # TODO el juego vive aquí (~1114 líneas): lobby, red PeerJS,
-                                 # físicas, colisiones, render canvas, UI y controles táctiles.
+├── src/
+│   ├── main.tsx                 # entry point (StrictMode + createRoot)
+│   ├── index.css                # Tailwind + tema + clases utilitarias (hud-panel, btn-sci-fi, glow-*)
+│   └── App.tsx                  # TODO el juego vive aquí (~1200 líneas): lobby, red PeerJS,
+│                                # físicas, colisiones, render canvas, UI y controles táctiles.
+└── server/                      # Backend FastAPI en Fly.io: mintea iceServers frescos desde
+    │                            # la API de Cloudflare Realtime TURN.
+    ├── pyproject.toml           # fastapi[standard] + httpx
+    ├── app/main.py              # `GET /ice-servers` → `{iceServers: RTCIceServer[]}`
+    ├── turn_config.json         # gitignorado; Token ID + API Token de Cloudflare
+    └── README.md                # cómo correrlo en local y cómo se despliega
 ```
 
 ## 5. Flujos principales
@@ -67,10 +73,11 @@ No hay tests automatizados ni CI configurados. `npm run lint` hace solo typechec
 - **room_lobby**: muestra el id de sala, la lista de pilotos (hasta 7 slots) y — solo para el host — un botón "Iniciar Secuencia" que manda `{ type: 'start_race' }` a todos.
 - **playing**: render del canvas + controles.
 
-### 5.2 Red (PeerJS)
+### 5.2 Red (PeerJS + TURN propio)
 
-- **Host:** `createRoom()` genera un código `CODE` de 6 chars (alfabeto sin ambiguos) y abre un `Peer("microspeed-room-"+CODE, { debug: 2 })`. Acepta conexiones entrantes y mantiene un `connsRef: Map<peerId, DataConnection>`. La UI muestra solo `CODE` al usuario.
-- **Cliente:** `joinRoom()` normaliza el código escrito, reconstruye el peer id `microspeed-room-<CODE>` y abre un `Peer(undefined, { debug: 2 })` anónimo que llama `peer.connect(hostPeerId)`. Errores `peer-unavailable` se traducen en "no hay ninguna sala con código X".
+- **Arranque:** en cuanto se carga el módulo, el cliente hace `fetch` a `${VITE_TURN_SERVER_URL}/ice-servers` para obtener credenciales TURN frescas de Cloudflare Realtime (TTL 2 h por defecto). El resultado se cachea en una promesa durante toda la vida de la pestaña. Si la URL no está configurada o el fetch falla, se cae a `VITE_TURN_URL/USERNAME/CREDENTIAL` si existen, y en último extremo a los defaults de PeerJS.
+- **Host:** `createRoom()` genera un código `CODE` de 6 chars (alfabeto sin ambiguos), reconstruye el peer id `microspeed-room-<CODE>`, hace `await buildPeerOptions()` y abre el `Peer(peerId, { debug: 2, config: { iceServers } })`. La UI muestra solo `CODE` al usuario.
+- **Cliente:** `joinRoom()` normaliza el código escrito, reconstruye el peer id `microspeed-room-<CODE>`, `await buildPeerOptions()` y abre un `Peer(undefined, { debug: 2, config: { iceServers } })` anónimo que llama `peer.connect(hostPeerId)`. Errores `peer-unavailable` se traducen en "no hay ninguna sala con código X".
 - **Handshake:** al abrir una conexión, el cliente envía `{ type: 'hello', name }`. El host registra el nombre en `playerNamesRef` y reemite el lobby completo con `{ type: 'lobby_sync', players, names }` a todo el mundo.
 - **Mensajes definidos:**
   - `hello` → cliente → host, lleva el nickname.
