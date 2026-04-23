@@ -21,6 +21,20 @@ const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin O/0/1/I/L amb
 const PEER_ID_PREFIX = 'microspeed-room-';
 const ROOM_CODE_LENGTH = 6;
 
+// Paleta exclusiva del lobby. Un color por piloto — el host es la fuente de
+// verdad y valida que no haya dos pilotos con el mismo color. Tamaño >= 7
+// (capacidad máxima de la sala) para garantizar que siempre haya un color
+// libre al entrar.
+const COLOR_PALETTE = [
+  '#ef4444', // rojo
+  '#3b82f6', // azul
+  '#10b981', // verde
+  '#f59e0b', // ámbar
+  '#8b5cf6', // violeta
+  '#ec4899', // rosa
+  '#f27d26', // naranja (tema)
+];
+
 const metaEnv: Record<string, string | undefined> = (import.meta as any).env ?? {};
 // URL del backend que mintea credenciales TURN frescas. Hardcodeamos como
 // default la instancia pública en Fly.io para que el juego funcione en
@@ -301,9 +315,11 @@ export default function App() {
   const [lobbyPlayers, setLobbyPlayers] = useState<string[]>([]);
   const [playerName, setPlayerName] = useState(() => `Piloto-${Math.floor(Math.random() * 9000 + 1000)}`);
   const [playerNames, setPlayerNames] = useState<Record<string, string>>({});
-  
+  const [playerColors, setPlayerColors] = useState<Record<string, string>>({});
+
   const playerNameRef = useRef(playerName);
   const playerNamesRef = useRef<Record<string, string>>({});
+  const playerColorsRef = useRef<Record<string, string>>({});
   
   // Sincronizar estado con ref
   useEffect(() => { playerNameRef.current = playerName; }, [playerName]);  
@@ -362,9 +378,11 @@ export default function App() {
       myIdRef.current = assignedId;
       setLobbyPlayers([assignedId]);
 
-      // Host asigna su propio nombre
+      // Host asigna su propio nombre y reserva el primer color de la paleta.
       playerNamesRef.current[assignedId] = playerNameRef.current;
       setPlayerNames({...playerNamesRef.current});
+      playerColorsRef.current[assignedId] = COLOR_PALETTE[0];
+      setPlayerColors({...playerColorsRef.current});
 
       setView('room_lobby');
     });
@@ -438,22 +456,50 @@ export default function App() {
     isHost.current = false;
   };
 
-  const setupConnection = (conn: DataConnection) => {
-    const syncLobby = () => {
-        const currentList = [myIdRef.current, ...Array.from(connsRef.current.keys())];
-        setLobbyPlayers(currentList);
-        const msg = { type: 'lobby_sync', players: currentList, names: playerNamesRef.current };
-        Array.from(connsRef.current.values()).forEach((c: any) => {
-            if (c.open) c.send(msg);
-        });
+  // Emite el estado del lobby (lista, nombres y colores) a todos los clientes.
+  // Lo usa el host como fuente de verdad; los clientes no llaman a esta función.
+  const broadcastLobby = () => {
+    const currentList = [myIdRef.current, ...Array.from(connsRef.current.keys())];
+    setLobbyPlayers(currentList);
+    const msg = {
+      type: 'lobby_sync',
+      players: currentList,
+      names: playerNamesRef.current,
+      colors: playerColorsRef.current,
     };
+    Array.from(connsRef.current.values()).forEach((c: any) => {
+      if (c.open) c.send(msg);
+    });
+  };
 
+  // Elegir un color en el lobby.
+  // - Si soy host: actualizo el mapa local y reemito a todos.
+  // - Si soy cliente: mando `request_color` al host; el host valida y contesta
+  //   con un nuevo `lobby_sync`. La UI optimistic-paintea tras recibirlo.
+  const pickColor = (color: string) => {
+    if (!COLOR_PALETTE.includes(color)) return;
+    const myId = myIdRef.current;
+    const takenByOther = Object.entries(playerColorsRef.current).some(
+      ([pid, c]) => pid !== myId && c === color,
+    );
+    if (takenByOther) return;
+    if (isHost.current) {
+      playerColorsRef.current[myId] = color;
+      setPlayerColors({...playerColorsRef.current});
+      broadcastLobby();
+    } else {
+      const hostConn = Array.from(connsRef.current.values())[0] as DataConnection | undefined;
+      if (hostConn && hostConn.open) hostConn.send({ type: 'request_color', color });
+    }
+  };
+
+  const setupConnection = (conn: DataConnection) => {
     conn.on('open', () => {
       // Cliente envía su nombre al anfitrión
       conn.send({ type: 'hello', name: playerNameRef.current });
 
       if (isHost.current) {
-         syncLobby();
+         broadcastLobby();
       }
       setView(v => {
           if (v === 'joining') {
@@ -465,14 +511,43 @@ export default function App() {
     });
     conn.on('data', (data: any) => {
       if (data.type === 'hello' && isHost.current) {
-          // El anfitrión registra el nombre del nuevo jugador y reemite a todos
+          // El anfitrión registra el nombre del nuevo jugador y le asigna el
+          // primer color libre de la paleta. El cliente podrá cambiarlo luego
+          // desde el lobby con `request_color`.
           playerNamesRef.current[conn.peer] = data.name;
           setPlayerNames({...playerNamesRef.current});
-          syncLobby();
+          if (!playerColorsRef.current[conn.peer]) {
+              const used = new Set(Object.values(playerColorsRef.current));
+              const free = COLOR_PALETTE.find((c) => !used.has(c));
+              if (free) {
+                  playerColorsRef.current[conn.peer] = free;
+                  setPlayerColors({...playerColorsRef.current});
+              }
+          }
+          broadcastLobby();
+      } else if (data.type === 'request_color' && isHost.current) {
+          // El host valida que el color solicitado esté en la paleta y no lo
+          // esté usando otro piloto. Si hay conflicto, se ignora (el cliente
+          // verá en el próximo `lobby_sync` que su color no cambió).
+          const color = data.color;
+          if (typeof color !== 'string' || !COLOR_PALETTE.includes(color)) return;
+          const takenByOther = Object.entries(playerColorsRef.current).some(
+              ([pid, c]) => pid !== conn.peer && c === color,
+          );
+          if (takenByOther) {
+              broadcastLobby();
+              return;
+          }
+          playerColorsRef.current[conn.peer] = color;
+          setPlayerColors({...playerColorsRef.current});
+          broadcastLobby();
       } else if (data.type === 'lobby_sync') {
           setLobbyPlayers(data.players);
           setPlayerNames(data.names);
           playerNamesRef.current = data.names;
+          const colors = data.colors || {};
+          setPlayerColors(colors);
+          playerColorsRef.current = colors;
       } else if (data.type === 'start_race') {
           setView('playing');
       } else if (handleDataRef.current) {
@@ -486,8 +561,10 @@ export default function App() {
       } else {
           connsRef.current.delete(conn.peer);
           delete playerNamesRef.current[conn.peer];
+          delete playerColorsRef.current[conn.peer];
           setPlayerNames({...playerNamesRef.current});
-          syncLobby();
+          setPlayerColors({...playerColorsRef.current});
+          broadcastLobby();
       }
     });
     conn.on('error', (err) => {
@@ -541,7 +618,10 @@ export default function App() {
                 vx: 0, vy: 0,
                 speed: 0, maxSpeed: 8.5, acceleration: 0.14,
                 friction: 0.988, lateralFriction: 0.975, rotationSpeed: 0.055,
-                color: isSolo ? '#f27d26' : (isHost.current ? '#ef4444' : '#3b82f6'),
+                color: isSolo
+                    ? '#f27d26'
+                    : (playerColorsRef.current[myIdRef.current]
+                        || (isHost.current ? '#ef4444' : '#3b82f6')),
                 trail: []
             },
             remoteCars: {},
@@ -635,19 +715,42 @@ export default function App() {
       if (data.type === 'state') {
         const id = data.id;
         if (!gs.remoteCars[id]) {
-            const colors = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6', '#f43f5e'];
-            let hash = 0; for(let i=0; i<id.length; i++) hash += id.charCodeAt(i);
-            const rColor = colors[hash % colors.length];
-            gs.remoteCars[id] = { x: data.x, y: data.y, angle: data.angle, width: 20, height: 10, color: rColor, lap: data.lap, finished: data.finished, speed: data.speed, trail: [] };
+            // Color asignado en el lobby; si no hay (p. ej. reconexión con
+            // lobby_sync aún no recibido) caemos a un hash estable.
+            let rColor = playerColorsRef.current[id];
+            if (!rColor) {
+                const fallbacks = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6', '#f43f5e'];
+                let hash = 0; for(let i=0; i<id.length; i++) hash += id.charCodeAt(i);
+                rColor = fallbacks[hash % fallbacks.length];
+            }
+            // En la primera recepción, las posiciones "renderizadas" y el
+            // "objetivo" coinciden — no hay nada que interpolar todavía.
+            gs.remoteCars[id] = {
+                x: data.x, y: data.y, angle: data.angle,
+                targetX: data.x, targetY: data.y, targetAngle: data.angle,
+                width: 20, height: 10, color: rColor,
+                lap: data.lap, finished: data.finished, speed: data.speed,
+                trail: [],
+            };
+        } else {
+            // Solo actualizamos el objetivo; la interpolación del bucle de
+            // render llevará x/y/angle hacia targetX/Y/Angle suavemente para
+            // eliminar los "saltitos" entre paquetes (~30 Hz) y los frames
+            // (60+ fps).
+            gs.remoteCars[id].targetX = data.x;
+            gs.remoteCars[id].targetY = data.y;
+            gs.remoteCars[id].targetAngle = data.angle;
         }
-        gs.remoteCars[id].x = data.x;
-        gs.remoteCars[id].y = data.y;
-        gs.remoteCars[id].angle = data.angle;
         gs.remoteCars[id].lap = data.lap;
         gs.remoteCars[id].finished = data.finished;
         gs.remoteCars[id].speed = data.speed;
-        
-        // Actualizar estela del oponente
+        // Mantener el color sincronizado si el lobby lo cambió en vuelo
+        const assignedColor = playerColorsRef.current[id];
+        if (assignedColor) gs.remoteCars[id].color = assignedColor;
+
+        // Actualizar estela del oponente: usamos la posición oficial del
+        // snapshot (no la interpolada) para que los puntos de la estela
+        // estén bien espaciados en el "espacio de red".
         const rCos = Math.cos(data.angle);
         const rSin = Math.sin(data.angle);
         gs.remoteCars[id].trail.push({ x: data.x - rCos * 10, y: data.y - rSin * 10 });
@@ -894,6 +997,28 @@ export default function App() {
            };
            Array.from(connsRef.current.values()).forEach((c: any) => {
                if (c.open) c.send(sMsg);
+           });
+       }
+
+       // --- Interpolación de coches remotos ---
+       // Los paquetes llegan a ~30 Hz pero el canvas redibuja a 60+ fps. Si
+       // renderizamos la posición cruda del último paquete, el coche rival
+       // "salta" entre snapshots. Aproximamos suavemente la posición real a
+       // la objetivo con un lerp exponencial: con factor 0.3 por frame @60fps,
+       // cerramos un 83% del gap en ~48ms (cerca del intervalo entre paquetes),
+       // que da movimiento fluido sin añadir latencia perceptible. Para el
+       // ángulo normalizamos la diferencia al rango [-π, π] para evitar giros
+       // largos al cruzar la discontinuidad.
+       if (!isSolo) {
+           const LERP = 0.3;
+           Object.values(gs.remoteCars).forEach((r: any) => {
+               if (r.targetX === undefined) return;
+               r.x += (r.targetX - r.x) * LERP;
+               r.y += (r.targetY - r.y) * LERP;
+               let d = r.targetAngle - r.angle;
+               while (d > Math.PI) d -= 2 * Math.PI;
+               while (d < -Math.PI) d += 2 * Math.PI;
+               r.angle += d * LERP;
            });
        }
 
@@ -1154,10 +1279,14 @@ export default function App() {
                                     {lobbyPlayers.map((p, i) => {
                                         const displayName = playerNames[p] || (p === myIdRef.current ? playerName : p);
                                         const isMe = p === myIdRef.current;
+                                        const dotColor = playerColors[p] || '#00f3ff';
                                         return (
                                         <li key={i} className="flex justify-between items-center bg-zinc-900/80 border border-zinc-800 p-3 font-mono text-zinc-300 transition-colors hover:border-[#00f3ff]/50">
                                             <span className="flex items-center gap-3 truncate">
-                                                <span className="w-2 h-2 rounded-full bg-[#00f3ff] glow-text-cyan animate-pulse shrink-0"></span>
+                                                <span
+                                                    className="w-3 h-3 rounded-full animate-pulse shrink-0"
+                                                    style={{ backgroundColor: dotColor, boxShadow: `0 0 8px ${dotColor}` }}
+                                                ></span>
                                                 <span className="truncate">{displayName} {isMe ? (isHost.current ? '[HOST]' : '[YOU]') : ''}</span>
                                             </span>
                                             <span className="text-xs text-[#00f3ff]/80 font-bold uppercase tracking-wider backdrop-blur-sm bg-[#00f3ff]/10 px-2 py-1 shrink-0">En Línea</span>
@@ -1169,6 +1298,38 @@ export default function App() {
                                         </li>
                                     ))}
                                 </ul>
+                            </div>
+
+                            <div className="w-full mb-6">
+                                <div className="flex justify-between items-end mb-2 border-b border-zinc-700 pb-2">
+                                    <h3 className="text-sm tracking-widest font-bold text-zinc-300 uppercase">Color de Nave</h3>
+                                    <span className="font-mono text-[#00f3ff] text-xs uppercase opacity-70">Exclusivo por piloto</span>
+                                </div>
+                                <div className="flex flex-wrap gap-2 pt-2">
+                                    {COLOR_PALETTE.map((c) => {
+                                        const ownerId = Object.entries(playerColors).find(([, col]) => col === c)?.[0];
+                                        const isMine = ownerId === myIdRef.current;
+                                        const takenByOther = !!ownerId && !isMine;
+                                        return (
+                                            <button
+                                                key={c}
+                                                type="button"
+                                                onClick={() => pickColor(c)}
+                                                disabled={takenByOther}
+                                                aria-label={`Elegir color ${c}${isMine ? ' (el tuyo)' : takenByOther ? ' (ocupado)' : ''}`}
+                                                title={takenByOther ? (playerNames[ownerId] || 'ocupado') : c}
+                                                className={`w-10 h-10 border-2 transition-all ${
+                                                    isMine
+                                                        ? 'border-white scale-110 shadow-[0_0_10px_rgba(255,255,255,0.6)]'
+                                                        : takenByOther
+                                                            ? 'border-zinc-700 opacity-30 cursor-not-allowed grayscale'
+                                                            : 'border-zinc-700 hover:border-[#00f3ff] hover:scale-105'
+                                                }`}
+                                                style={{ backgroundColor: c }}
+                                            />
+                                        );
+                                    })}
+                                </div>
                             </div>
                             
                             <div className="flex gap-4 w-full mt-4">
