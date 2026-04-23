@@ -28,8 +28,20 @@ if (customTurnUrl && customTurnUsername && customTurnCredential) {
     credential: customTurnCredential,
   });
 } else {
-  // Fallback público (sin registro). Si algún día se cae, basta con apuntar las
-  // env vars a Twilio/Cloudflare Realtime/Xirsys/coturn propio.
+  // Fallbacks públicos (sin registro). Son poco fiables y están rate-limited;
+  // para uso real conviene definir VITE_TURN_* apuntando a TURN propio.
+  // 1) TURN por defecto que trae PeerJS (Heroku, user peerjs/peerjsp). Va sobre
+  //    TCP 3478: útil cuando los firewalls dejan solo HTTP/HTTPS fuera.
+  iceServers.push({
+    urls: [
+      'turn:eu-0.turn.peerjs.com:3478',
+      'turn:us-0.turn.peerjs.com:3478',
+    ],
+    username: 'peerjs',
+    credential: 'peerjsp',
+  });
+  // 2) OpenRelay Metered (histórico, el puerto 443 puede estar caído; lo dejamos
+  //    como último recurso detrás del TURN de PeerJS).
   iceServers.push({
     urls: [
       'turn:openrelay.metered.ca:80',
